@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.get-pip.py
+log/*
+!log/.gitkeep
+*.session
+*.session-journal
+.userbot_code
+.userbot_need_password
+neon_bot.code-workspace
