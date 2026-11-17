@@ -19,7 +19,12 @@ from pathlib import Path
 
 from telethon import TelegramClient
 
-from stream_probe import bind_stream_command, leave_joined_call, start_call_engine
+from stream_probe import (
+    bind_stream_command,
+    leave_joined_call,
+    recover_local_wavs,
+    start_call_engine,
+)
 from telethon.errors import (
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
@@ -206,7 +211,9 @@ async def run(args: argparse.Namespace) -> int:
             return 0
         bind_stream_command(client)
         await start_call_engine()
-        print("Команда !str пишет эфир в wav. !str 0 выходит.")
+        asyncio.create_task(recover_local_wavs(client))
+        print("В Избранное: !rec имя_чата. Каждые 30 минут wav уходит туда и удаляется с диска.")
+        print("Раньше срока: !rec 0. В чате эфира по-прежнему !str и !str 0.")
         print("Сессия сохранена. Ожидание. Остановка: Ctrl+C")
         await client.run_until_disconnected()
         if _stop_requested:

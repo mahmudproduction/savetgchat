@@ -12,19 +12,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import secrets
 import signal
 import struct
 import sys
 import threading
 import time
+from array import array
 from pathlib import Path
 
 from pytgcalls import PyTgCalls
 from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
 from pytgcalls.types import Device, Direction, GroupCallConfig, RecordStream, StreamFrames
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import RPCError
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
@@ -44,6 +46,8 @@ from telethon.tl.types import (
     InputGroupCall,
     InputGroupCallStream,
     InputPeerSelf,
+    PeerChannel,
+    PeerChat,
     UpdateGroupCall,
     UpdateGroupCallConnection,
 )
@@ -57,6 +61,10 @@ OUT_DIR = ROOT / "log"
 SEGMENT_MS = 1000
 BUFFER_MS = 2000
 CHUNK_LIMIT = 1024 * 1024
+SEGMENT_SECONDS = 30 * 60
+PCM_RATE = 48000
+PCM_CHANNELS = 2
+PCM_BYTES_PER_SECOND = PCM_RATE * PCM_CHANNELS * 2
 _stop_requested = False
 
 
@@ -236,23 +244,83 @@ _calls: PyTgCalls | None = None
 _wav: "PcmWav | None" = None
 
 
+def wav_header(size: int, rate: int = PCM_RATE, channels: int = PCM_CHANNELS) -> bytes:
+    block = channels * 2
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        rate,
+        rate * block,
+        block,
+        16,
+        b"data",
+        size,
+    )
+
+
+def safe_chat_title(title: str) -> str:
+    """Имя файла без символов, которые ломают путь. Эпохи дописываются следом."""
+    cleaned = []
+    for char in title.strip():
+        if char in '\\/:*?"<>|' or ord(char) < 32:
+            continue
+        cleaned.append(char)
+    text = "".join(cleaned).strip().strip(".")
+    return (text or "chat")[:80]
+
+
+def segment_filename(title: str, started_at: float, stopped_at: float) -> str:
+    start = int(started_at)
+    stop = max(start, int(stopped_at))
+    return f"{safe_chat_title(title)}{start}{stop}.wav"
+
+
+def repair_wav(path: Path) -> int:
+    """Дописывает заголовок, если процесс остановился до close. Возвращает байты PCM."""
+    with path.open("r+b") as handle:
+        marker = handle.read(12)
+        handle.seek(0, os.SEEK_END)
+        total = handle.tell()
+        if marker.startswith(b"RIFF"):
+            return max(0, total - 44)
+        if total <= 44:
+            return 0
+        size = total - 44
+        handle.seek(0)
+        handle.write(wav_header(size))
+        return size
+
+
 class PcmWav:
     """Пишет PCM 16 бит в wav без ffmpeg."""
 
-    def __init__(self, path: Path, rate: int = 48000, channels: int = 2) -> None:
+    def __init__(self, path: Path, rate: int = PCM_RATE, channels: int = PCM_CHANNELS) -> None:
         self.path = path
         self.rate = rate
         self.channels = channels
         self.size = 0
         self.chat_id: int | None = None
+        self.chat_title = "chat"
+        self.started_at = time.time()
         self._device = None
-        self._ssrc: int | None = None
+        self._known: set[int] = set()
+        self._tracks: dict[int, tuple[int, array]] = {}
+        self._origin_ms: int | None = None
+        self._use_time = False
+        self._emitted = 0
+        self._delay_frames = self.rate // 5
         self._lock = threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._file = path.open("wb")
         self._file.write(b"\0" * 44)
 
-    def write(self, data: bytes, device: Device, ssrc: int) -> None:
+    def write(self, data: bytes, device: Device, ssrc: int, capture_ms: int = 0) -> None:
         if not data:
             return
         with self._lock:
@@ -260,37 +328,117 @@ class PcmWav:
                 return
             if self._device is None:
                 self._device = device
-                self._ssrc = ssrc
-            elif device != self._device or ssrc != self._ssrc:
+            elif device != self._device:
                 return
-            self._file.write(data)
-            self.size += len(data)
-            self._file.flush()
+            self._mix(data, ssrc, capture_ms, final=False)
 
     def close(self) -> None:
         with self._lock:
             if self._file.closed:
                 return
-            block = self.channels * 2
-            header = struct.pack(
-                "<4sI4s4sIHHIIHH4sI",
-                b"RIFF",
-                36 + self.size,
-                b"WAVE",
-                b"fmt ",
-                16,
-                1,
-                self.channels,
-                self.rate,
-                self.rate * block,
-                block,
-                16,
-                b"data",
-                self.size,
-            )
+            self._mix(b"", 0, 0, final=True)
             self._file.seek(0)
-            self._file.write(header)
+            self._file.write(wav_header(self.size, self.rate, self.channels))
             self._file.close()
+
+    def _mix(self, data: bytes, ssrc: int, capture_ms: int, final: bool) -> None:
+        channels = self.channels
+        width = channels * 2
+        if data:
+            data = data[: len(data) - (len(data) % width)]
+        if data:
+            incoming = array("h")
+            incoming.frombytes(data)
+            frames = len(incoming) // channels
+            if self._origin_ms is None:
+                self._origin_ms = capture_ms if capture_ms else 0
+                self._use_time = bool(capture_ms)
+            if self._use_time and capture_ms:
+                pos = int((capture_ms - self._origin_ms) * self.rate / 1000)
+                if pos < 0:
+                    pos = 0
+            else:
+                current = self._tracks.get(ssrc)
+                pos = self._emitted if current is None else current[0] + len(current[1]) // channels
+            if pos < self._emitted:
+                skip = self._emitted - pos
+                if skip < frames:
+                    incoming = incoming[skip * channels :]
+                    pos = self._emitted
+                    frames = len(incoming) // channels
+                else:
+                    incoming = array("h")
+                    frames = 0
+            if frames:
+                if ssrc not in self._known:
+                    self._known.add(ssrc)
+                    print(f"В записи голосов: {len(self._known)}", flush=True)
+                self._place(ssrc, pos, incoming)
+        if not self._tracks:
+            return
+        horizon = max(start + len(samples) // channels for start, samples in self._tracks.values())
+        limit = horizon if final else horizon - self._delay_frames
+        if limit <= self._emitted:
+            return
+        count = limit - self._emitted
+        mixed = [0] * (count * channels)
+        for start, samples in self._tracks.values():
+            begin = max(self._emitted, start)
+            end = min(limit, start + len(samples) // channels)
+            if begin >= end:
+                continue
+            src = (begin - start) * channels
+            dst = (begin - self._emitted) * channels
+            span = (end - begin) * channels
+            for index in range(span):
+                mixed[dst + index] += samples[src + index]
+        out = array("h", (0,)) * (count * channels)
+        for index, value in enumerate(mixed):
+            if value > 32767:
+                value = 32767
+            elif value < -32768:
+                value = -32768
+            out[index] = value
+        payload = out.tobytes()
+        self._file.write(payload)
+        self.size += len(payload)
+        self._file.flush()
+        self._emitted = limit
+        kept: dict[int, tuple[int, array]] = {}
+        for key, (start, samples) in self._tracks.items():
+            total = len(samples) // channels
+            if start + total <= self._emitted:
+                continue
+            drop = self._emitted - start
+            if drop > 0:
+                del samples[: drop * channels]
+                start = self._emitted
+            kept[key] = (start, samples)
+        self._tracks = kept
+
+    def _place(self, ssrc: int, pos: int, incoming: array) -> None:
+        channels = self.channels
+        current = self._tracks.get(ssrc)
+        if current is None:
+            self._tracks[ssrc] = (pos, incoming)
+            return
+        start, samples = current
+        end = start + len(samples) // channels
+        frames = len(incoming) // channels
+        if pos > end:
+            samples.extend([0] * ((pos - end) * channels))
+        elif pos < start:
+            shift = (start - pos) * channels
+            blank = array("h", [0] * shift)
+            blank.extend(samples)
+            samples = blank
+            start = pos
+        local = (pos - start) * channels
+        need = local + len(incoming)
+        if need > len(samples):
+            samples.extend([0] * (need - len(samples)))
+        samples[local : local + len(incoming)] = incoming
+        self._tracks[ssrc] = (start, samples)
 
 
 async def _record_until_stop(
@@ -331,27 +479,102 @@ async def _record_until_stop(
             print(f"кусок: {len(data)} байт, всего {seat['bytes']}", flush=True)
 
 
+def open_recording(title: str, chat_id: int) -> PcmWav:
+    started = time.time()
+    path = OUT_DIR / f".recording_{chat_id}_{int(started)}.wav"
+    wav = PcmWav(path)
+    wav.chat_id = chat_id
+    wav.chat_title = title or "chat"
+    wav.started_at = started
+    return wav
+
+
+def active_recording_path() -> Path | None:
+    wav = _wav
+    if wav is None:
+        return None
+    return wav.path
+
+
+async def deliver_recording(client: TelegramClient, wav: PcmWav) -> str:
+    """Закрывает wav, шлёт его в Избранное и удаляет локальную копию после успеха."""
+    wav.close()
+    if wav.size <= 0 or not wav.path.exists():
+        wav.path.unlink(missing_ok=True)
+        return "Сегмент без звука. Файл в Избранное не отправлял."
+    stopped = time.time()
+    final = OUT_DIR / segment_filename(wav.chat_title, wav.started_at, stopped)
+    if final.exists():
+        final = OUT_DIR / f"{final.stem}_{int(stopped)}.wav"
+    wav.path.replace(final)
+    wav.path = final
+    try:
+        await client.send_file("me", str(final), caption=final.name, force_document=True)
+    except Exception as exc:
+        return f"Не отправился, файл оставлен в log: {final.name}. {redact(str(exc))}"
+    try:
+        final.unlink()
+    except OSError as exc:
+        return f"Файл отправлен, но с диска не удалился: {final.name}. {exc}"
+    return f"Отправлен в Избранное и удалён с диска: {final.name}"
+
+
+async def roll_segment() -> None:
+    """Закрывает текущие 30 минут и сразу продолжает запись следующим файлом."""
+    global _wav
+    async with _seat_lock:
+        if _seat is None or _wav is None:
+            return
+        old = _wav
+        client = _seat["client"]
+        fresh = open_recording(old.chat_title, int(old.chat_id or 0))
+        _wav = fresh
+        _seat["wav"] = fresh
+    note = await deliver_recording(client, old)
+    print(note, flush=True)
+    await tell_saved(client, note)
+
+
+async def _segment_loop(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=SEGMENT_SECONDS)
+        except asyncio.TimeoutError:
+            if stop.is_set():
+                return
+            try:
+                await roll_segment()
+            except Exception as exc:
+                print(f"Смена файла: {redact(str(exc))}", flush=True)
+            continue
+        return
+
+
 async def leave_joined_call() -> str:
-    """Выходит из эфира, в котором сидит команда !str. Повторный вызов безопасен."""
+    """Выходит из эфира. Текущий кусок уходит в Избранное и удаляется после отправки."""
     global _seat, _wav
     async with _seat_lock:
         seat = _seat
         wav = _wav
         _seat = None
         _wav = None
+        if seat is not None and seat.get("stop") is not None:
+            seat["stop"].set()
     if seat is None and wav is None:
         return "Сейчас не в эфире."
-    if wav is not None:
-        wav.close()
-    if seat is not None and seat.get("stop") is not None:
-        seat["stop"].set()
     task = None if seat is None else seat.get("task")
     if task is not None:
-        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+    sent = "Файл записи не открыт."
+    if wav is not None and seat is not None:
+        try:
+            sent = await deliver_recording(seat["client"], wav)
+        except Exception as exc:
+            sent = redact(str(exc)) or "ошибка отправки"
+        print(sent, flush=True)
     chat_id = None if seat is None else seat.get("chat_id")
     if _calls is not None and chat_id is not None and seat is not None and seat.get("engine") == "tgcalls":
         try:
@@ -365,12 +588,73 @@ async def leave_joined_call() -> str:
             await seat["client"](LeaveGroupCallRequest(seat["call"], seat["ssrc"]))
         except RPCError as exc:
             print(f"Выход из эфира: {redact(exc.message)}", flush=True)
-    size = 0 if wav is None else wav.size
-    if wav is not None and size:
-        return f"Вышел из эфира. Записано {size} байт в {wav.path.name}."
-    if wav is not None:
-        return f"Вышел из эфира. Файл {wav.path.name} без звука: кадров не было."
-    return "Вышел из эфира."
+    return f"Вышел из эфира. {sent}"
+
+
+async def legacy_title(client: TelegramClient, path: Path) -> str:
+    name = path.name
+    if not (name.startswith("call_") and name.endswith(".wav")):
+        return "chat"
+    raw = name[len("call_") : -len(".wav")]
+    head = raw.split("_", 1)[0]
+    if not head.isdigit():
+        return "chat"
+    chat_id = int(head)
+    for peer in (PeerChannel(chat_id), PeerChat(chat_id)):
+        try:
+            entity = await client.get_entity(peer)
+        except Exception:
+            continue
+        title = getattr(entity, "title", None)
+        if title:
+            return str(title)
+    return f"chat{chat_id}"
+
+
+async def send_finished_file(client: TelegramClient, path: Path, title: str | None) -> None:
+    if not path.is_file():
+        return
+    if active_recording_path() == path:
+        return
+    pcm = repair_wav(path)
+    if pcm <= 0:
+        path.unlink(missing_ok=True)
+        return
+    stopped = path.stat().st_mtime
+    started = stopped - (pcm / PCM_BYTES_PER_SECOND)
+    label = title or await legacy_title(client, path)
+    final = OUT_DIR / segment_filename(label, started, stopped)
+    if final.resolve() != path.resolve():
+        if final.exists():
+            final = OUT_DIR / f"{final.stem}_{int(stopped)}.wav"
+        path.replace(final)
+    try:
+        await client.send_file("me", str(final), caption=final.name, force_document=True)
+    except Exception as exc:
+        note = f"Не отправился, файл оставлен в log: {final.name}. {redact(str(exc))}"
+        print(note, flush=True)
+        await tell_saved(client, note)
+        return
+    try:
+        final.unlink()
+    except OSError as exc:
+        note = f"Файл отправлен, но с диска не удалился: {final.name}. {exc}"
+        print(note, flush=True)
+        await tell_saved(client, note)
+        return
+    note = f"Отправлен в Избранное и удалён с диска: {final.name}"
+    print(note, flush=True)
+    await tell_saved(client, note)
+
+
+async def recover_local_wavs(client: TelegramClient) -> None:
+    """Отправляет wav, оставшиеся после прошлой записи, и удаляет их после успеха."""
+    try:
+        paths = sorted(OUT_DIR.glob("*.wav")) + sorted(OUT_DIR.glob(".recording_*.wav"))
+        for path in paths:
+            await send_finished_file(client, path, None)
+    except Exception as exc:
+        print(f"Разбор старых записей: {redact(str(exc))}", flush=True)
 
 
 async def enter_and_wait(client: TelegramClient, entity: object, chat_id: int) -> str:
@@ -404,14 +688,14 @@ async def enter_and_wait(client: TelegramClient, entity: object, chat_id: int) -
 
     async with _seat_lock:
         if _seat is not None and _seat["chat_id"] == chat_id:
-            return "Уже сижу в эфире этого чата. Выход: !str 0"
+            return "Уже сижу в эфире этого чата. Каждые 30 минут файл уходит в Избранное. Выход: !rec 0"
     if _seat is not None:
         await leave_joined_call()
     if _calls is None:
         return "Движок звонка не запущен."
 
-    wav = PcmWav(OUT_DIR / f"call_{entity.id}.wav")
-    wav.chat_id = chat_id
+    title = getattr(entity, "title", None) or "чат"
+    wav = open_recording(str(title), chat_id)
     global _wav
     async with _seat_lock:
         _wav = wav
@@ -444,18 +728,21 @@ async def enter_and_wait(client: TelegramClient, entity: object, chat_id: int) -
     except Exception as exc:
         print(f"Микрофон: {redact(str(exc))}", flush=True)
 
+    stop = asyncio.Event()
+    timer = asyncio.create_task(_segment_loop(stop))
     async with _seat_lock:
         _seat = {
             "client": client,
             "chat_id": chat_id,
-            "stop": asyncio.Event(),
-            "task": None,
+            "stop": stop,
+            "task": timer,
             "engine": "tgcalls",
             "wav": wav,
         }
     return (
         f"Вошёл, участников {group_call.participants_count}. "
-        f"Пишу разговор в {wav.path.name}, микрофон выключен. Выход: !str 0"
+        "Пишу по 30 минут. Каждый файл придёт в Избранное и удалится с диска. "
+        "Микрофон выключен. Раньше: !rec 0"
     )
 
 
@@ -475,7 +762,8 @@ async def _on_call_audio(_client: PyTgCalls, update: object) -> None:
     if update.device not in (Device.MICROPHONE, Device.SPEAKER):
         return
     for frame in update.frames:
-        wav.write(frame.frame or b"", update.device, frame.ssrc)
+        capture = int(getattr(getattr(frame, "info", None), "capture_time", 0) or 0)
+        wav.write(frame.frame or b"", update.device, frame.ssrc, capture)
 
 
 async def start_call_engine() -> None:
@@ -483,13 +771,77 @@ async def start_call_engine() -> None:
         await _calls.start()
 
 
+def rec_target(raw: str) -> str:
+    """Оставляет имя чата из !rec: без @, схемы и хвоста ссылки t.me."""
+    text = raw.strip()
+    lower = text.lower()
+    for prefix in ("https://", "http://"):
+        if lower.startswith(prefix):
+            text = text[len(prefix) :]
+            lower = text.lower()
+            break
+    for prefix in ("t.me/", "telegram.me/"):
+        if lower.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    text = text.split("/", 1)[0].split("?", 1)[0].strip()
+    if text.startswith("@"):
+        text = text[1:]
+    return text
+
+
 def bind_stream_command(client: TelegramClient) -> None:
-    """!str входит в эфир этого чата и пишет звук в wav. !str 0 выходит."""
+    """!str пишет эфир текущего чата. !rec имя в Избранном пишет эфир этого чата."""
     global _calls
     from telethon import events
 
     _calls = PyTgCalls(client)
     _calls.on_update()(_on_call_audio)
+    saved_chat_id: list[int | None] = [None]
+
+    async def in_saved(event: events.NewMessage.Event) -> bool:
+        if saved_chat_id[0] is None:
+            me = await client.get_me()
+            saved_chat_id[0] = int(me.id) if me is not None else 0
+        return bool(event.out and event.is_private and event.chat_id == saved_chat_id[0])
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^!rec(?:\s+(\S+))?\s*$"))
+    async def on_saved_record(event: events.NewMessage.Event) -> None:
+        if not await in_saved(event):
+            return
+        raw = event.pattern_match.group(1) or ""
+        target = rec_target(raw)
+        print("Команда !rec", flush=True)
+        try:
+            if not target:
+                await tell_saved(
+                    client,
+                    "Формат: !rec имя_чата. Пример: !rec debati_life. "
+                    "Каждые 30 минут файл приходит в Избранное. Стоп: !rec 0",
+                )
+                return
+            if target == "0":
+                message = await leave_joined_call()
+                print(message, flush=True)
+                await tell_saved(client, message)
+                return
+            try:
+                entity = await client.get_entity(target)
+            except Exception as exc:
+                message = f"Чат не найден: {redact(str(exc)) or 'нет такого имени'}"
+                print(message, flush=True)
+                await tell_saved(client, message)
+                return
+            title = getattr(entity, "title", None) or target
+            chat_id = utils.get_peer_id(entity)
+            await tell_saved(client, f"{title}: вхожу в эфир без микрофона и остаюсь там.")
+            message = await enter_and_wait(client, entity, chat_id)
+            print(message, flush=True)
+            await tell_saved(client, f"{title}: {message}")
+        except Exception as exc:
+            message = redact(str(exc)) or "ошибка проверки"
+            print(message, flush=True)
+            await tell_saved(client, message)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^!str(?:\s+0)?\s*$"))
     async def on_stream_command(event: events.NewMessage.Event) -> None:
