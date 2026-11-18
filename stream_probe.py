@@ -50,6 +50,8 @@ from telethon.tl.types import (
     PeerChat,
     UpdateGroupCall,
     UpdateGroupCallConnection,
+    UpdateGroupCallParticipants,
+    UpdateNewAuthorization,
 )
 
 from config import USERBOT_HELP, get_telegram_api_hash, get_telegram_api_id, get_telegram_phone
@@ -242,6 +244,12 @@ _seat: dict | None = None
 _seat_lock = asyncio.Lock()
 _calls: PyTgCalls | None = None
 _wav: "PcmWav | None" = None
+_expect_drop = False
+_drop_lock = asyncio.Lock()
+_self_id: int | None = None
+_shutdown = asyncio.Event()
+_pending_choice: dict | None = None
+_other_session: dict | None = None
 
 
 def wav_header(size: int, rate: int = PCM_RATE, channels: int = PCM_CHANNELS) -> bytes:
@@ -496,7 +504,11 @@ def active_recording_path() -> Path | None:
     return wav.path
 
 
-async def deliver_recording(client: TelegramClient, wav: PcmWav) -> str:
+async def deliver_recording(
+    client: TelegramClient,
+    wav: PcmWav,
+    caption: str | None = None,
+) -> str:
     """Закрывает wav, шлёт его в Избранное и удаляет локальную копию после успеха."""
     wav.close()
     if wav.size <= 0 or not wav.path.exists():
@@ -509,7 +521,12 @@ async def deliver_recording(client: TelegramClient, wav: PcmWav) -> str:
     wav.path.replace(final)
     wav.path = final
     try:
-        await client.send_file("me", str(final), caption=final.name, force_document=True)
+        await client.send_file(
+            "me",
+            str(final),
+            caption=caption or final.name,
+            force_document=True,
+        )
     except Exception as exc:
         return f"Не отправился, файл оставлен в log: {final.name}. {redact(str(exc))}"
     try:
@@ -550,45 +567,174 @@ async def _segment_loop(stop: asyncio.Event) -> None:
         return
 
 
-async def leave_joined_call() -> str:
-    """Выходит из эфира. Текущий кусок уходит в Избранное и удаляется после отправки."""
-    global _seat, _wav
-    async with _seat_lock:
-        seat = _seat
-        wav = _wav
-        _seat = None
-        _wav = None
-        if seat is not None and seat.get("stop") is not None:
-            seat["stop"].set()
-    if seat is None and wav is None:
-        return "Сейчас не в эфире."
-    task = None if seat is None else seat.get("task")
-    if task is not None:
+def shutdown_requested() -> bool:
+    return _shutdown.is_set()
+
+
+async def request_shutdown(client: TelegramClient) -> None:
+    """Останавливает юзербота без перезапуска службой: выход 0."""
+    _shutdown.set()
+    if client.is_connected():
+        await client.disconnect()
+
+
+def _remember_other_session(update: UpdateNewAuthorization) -> None:
+    global _other_session
+    _other_session = {
+        "at": time.time(),
+        "device": (update.device or "").strip(),
+        "location": (update.location or "").strip(),
+    }
+    print("Замечено подключение другой сессии.", flush=True)
+
+
+def _session_note() -> str:
+    info = _other_session
+    if info is None or time.time() - float(info["at"]) > 180:
+        return "Подключение с другой сессии выкинуло из записываемого эфира."
+    lines = ["Подключение с другой сессии выкинуло из записываемого эфира."]
+    if info["device"]:
+        lines.append(f"Устройство: {info['device']}")
+    if info["location"]:
+        lines.append(f"Место: {info['location']}")
+    return "\n".join(lines)
+
+
+async def _stop_seat_tasks(seat: dict | None) -> None:
+    if seat is None:
+        return
+    current = asyncio.current_task()
+    for task in (seat.get("task"), seat.get("watch")):
+        if task is None or task is current:
+            continue
+        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-    sent = "Файл записи не открыт."
-    if wav is not None and seat is not None:
-        try:
-            sent = await deliver_recording(seat["client"], wav)
-        except Exception as exc:
-            sent = redact(str(exc)) or "ошибка отправки"
-        print(sent, flush=True)
-    chat_id = None if seat is None else seat.get("chat_id")
-    if _calls is not None and chat_id is not None and seat is not None and seat.get("engine") == "tgcalls":
+
+
+async def _hang_up(seat: dict | None) -> None:
+    if seat is None:
+        return
+    chat_id = seat.get("chat_id")
+    if _calls is not None and chat_id is not None and seat.get("engine") == "tgcalls":
         try:
             await _calls.leave_call(chat_id)
         except NotInCallError:
             pass
         except Exception as exc:
             print(f"Выход из эфира: {redact(str(exc))}", flush=True)
-    elif seat is not None and seat.get("call") is not None:
+    elif seat.get("call") is not None:
         try:
             await seat["client"](LeaveGroupCallRequest(seat["call"], seat["ssrc"]))
         except RPCError as exc:
             print(f"Выход из эфира: {redact(exc.message)}", flush=True)
-    return f"Вышел из эфира. {sent}"
+
+
+def _choice_text(title: str) -> str:
+    return (
+        f"Вернуться в записываемый чат «{title}» — 0\n"
+        "Завершить работу юзербота — 1"
+    )
+
+
+async def dropped_by_other_session() -> None:
+    """Эфир оборвался не нашей командой: файл в Избранное и вопрос 0 или 1."""
+    global _seat, _wav, _expect_drop, _pending_choice
+    if _expect_drop or _shutdown.is_set():
+        return
+    async with _drop_lock:
+        if _expect_drop or _seat is None:
+            return
+        _expect_drop = True
+        try:
+            async with _seat_lock:
+                seat = _seat
+                wav = _wav
+                _seat = None
+                _wav = None
+                if seat is not None and seat.get("stop") is not None:
+                    seat["stop"].set()
+            if seat is None:
+                return
+            await _stop_seat_tasks(seat)
+            await _hang_up(seat)
+            title = "чат"
+            chat_id = seat.get("chat_id")
+            if wav is not None:
+                title = wav.chat_title or title
+                chat_id = wav.chat_id if wav.chat_id is not None else chat_id
+            note = _session_note()
+            question = _choice_text(str(title))
+            sent = "Файл записи не открыт."
+            if wav is not None:
+                sent = await deliver_recording(
+                    seat["client"],
+                    wav,
+                    caption=f"{note}\n\n{question}",
+                )
+            _pending_choice = {
+                "chat_id": chat_id,
+                "title": str(title),
+                "client": seat["client"],
+            }
+            text = f"{note}\n{sent}\n{question}"
+            print(text, flush=True)
+            await tell_saved(seat["client"], text)
+        finally:
+            _expect_drop = False
+
+
+async def _watch_call(stop: asyncio.Event, chat_id: int) -> None:
+    """Если звонок исчез без команды выхода, это выход из другой сессии."""
+    await asyncio.sleep(5)
+    missing = 0
+    while not stop.is_set():
+        await asyncio.sleep(2)
+        if stop.is_set() or _expect_drop or _calls is None:
+            continue
+        try:
+            active = _calls._binding.calls()
+            if asyncio.iscoroutine(active):
+                active = await active
+        except Exception:
+            continue
+        if chat_id in active:
+            missing = 0
+            continue
+        missing += 1
+        if missing >= 2:
+            await dropped_by_other_session()
+            return
+
+
+async def leave_joined_call() -> str:
+    """Выходит из эфира. Текущий кусок уходит в Избранное и удаляется после отправки."""
+    global _seat, _wav, _expect_drop
+    _expect_drop = True
+    try:
+        async with _seat_lock:
+            seat = _seat
+            wav = _wav
+            _seat = None
+            _wav = None
+            if seat is not None and seat.get("stop") is not None:
+                seat["stop"].set()
+        if seat is None and wav is None:
+            return "Сейчас не в эфире."
+        await _stop_seat_tasks(seat)
+        sent = "Файл записи не открыт."
+        if wav is not None and seat is not None:
+            try:
+                sent = await deliver_recording(seat["client"], wav)
+            except Exception as exc:
+                sent = redact(str(exc)) or "ошибка отправки"
+            print(sent, flush=True)
+        await _hang_up(seat)
+        return f"Вышел из эфира. {sent}"
+    finally:
+        _expect_drop = False
 
 
 async def legacy_title(client: TelegramClient, path: Path) -> str:
@@ -730,12 +876,14 @@ async def enter_and_wait(client: TelegramClient, entity: object, chat_id: int) -
 
     stop = asyncio.Event()
     timer = asyncio.create_task(_segment_loop(stop))
+    watch = asyncio.create_task(_watch_call(stop, chat_id))
     async with _seat_lock:
         _seat = {
             "client": client,
             "chat_id": chat_id,
             "stop": stop,
             "task": timer,
+            "watch": watch,
             "engine": "tgcalls",
             "wav": wav,
         }
@@ -767,8 +915,13 @@ async def _on_call_audio(_client: PyTgCalls, update: object) -> None:
 
 
 async def start_call_engine() -> None:
-    if _calls is not None:
-        await _calls.start()
+    global _self_id
+    if _calls is None:
+        return
+    await _calls.start()
+    me = await _calls.mtproto_client.get_me()
+    if me is not None:
+        _self_id = int(me.id)
 
 
 def rec_target(raw: str) -> str:
@@ -790,6 +943,37 @@ def rec_target(raw: str) -> str:
     return text
 
 
+async def answer_resume(client: TelegramClient, choice: str) -> None:
+    """0 возвращает в тот же эфир, 1 останавливает юзербота."""
+    global _pending_choice
+    pending = _pending_choice
+    if pending is None:
+        return
+    _pending_choice = None
+    title = str(pending["title"])
+    chat_id = pending["chat_id"]
+    if choice == "1":
+        await tell_saved(client, "Останавливаю юзербота.")
+        await request_shutdown(client)
+        return
+    await tell_saved(client, f"Возвращаюсь в «{title}».")
+    try:
+        entity = await client.get_entity(chat_id)
+    except Exception as exc:
+        _pending_choice = pending
+        await tell_saved(
+            client,
+            f"Чат не открылся: {redact(str(exc)) or 'нет доступа'}\n{_choice_text(title)}",
+        )
+        return
+    message = await enter_and_wait(client, entity, int(chat_id))
+    if message.startswith("Вошёл"):
+        await tell_saved(client, f"{title}: {message}")
+        return
+    _pending_choice = pending
+    await tell_saved(client, f"{title}: {message}\n{_choice_text(title)}")
+
+
 def bind_stream_command(client: TelegramClient) -> None:
     """!str пишет эфир текущего чата. !rec имя в Избранном пишет эфир этого чата."""
     global _calls
@@ -804,6 +988,36 @@ def bind_stream_command(client: TelegramClient) -> None:
             me = await client.get_me()
             saved_chat_id[0] = int(me.id) if me is not None else 0
         return bool(event.out and event.is_private and event.chat_id == saved_chat_id[0])
+
+    @client.on(events.Raw)
+    async def on_raw_call(update: object) -> None:
+        if isinstance(update, UpdateNewAuthorization):
+            _remember_other_session(update)
+            return
+        if _self_id is None or _expect_drop or _seat is None:
+            return
+        if not isinstance(update, UpdateGroupCallParticipants):
+            return
+        for participant in update.participants:
+            peer = getattr(participant, "peer", None)
+            if getattr(peer, "user_id", None) != _self_id:
+                continue
+            if getattr(participant, "left", False):
+                await dropped_by_other_session()
+                return
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\s*([01])\s*$"))
+    async def on_digit(event: events.NewMessage.Event) -> None:
+        if _pending_choice is None or not await in_saved(event):
+            return
+        digit = event.pattern_match.group(1)
+        print(f"Выбор {digit}", flush=True)
+        try:
+            await answer_resume(client, digit)
+        except Exception as exc:
+            message = redact(str(exc)) or "ошибка выбора"
+            print(message, flush=True)
+            await tell_saved(client, message)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^!rec(?:\s+(\S+))?\s*$"))
     async def on_saved_record(event: events.NewMessage.Event) -> None:

@@ -23,6 +23,7 @@ from stream_probe import (
     bind_stream_command,
     leave_joined_call,
     recover_local_wavs,
+    shutdown_requested,
     start_call_engine,
 )
 from telethon.errors import (
@@ -214,9 +215,10 @@ async def run(args: argparse.Namespace) -> int:
         asyncio.create_task(recover_local_wavs(client))
         print("В Избранное: !rec имя_чата. Каждые 30 минут wav уходит туда и удаляется с диска.")
         print("Раньше срока: !rec 0. В чате эфира по-прежнему !str и !str 0.")
+        print("Если из эфира выкинет другая сессия, в Избранном ответьте 0 или 1.")
         print("Сессия сохранена. Ожидание. Остановка: Ctrl+C")
         await client.run_until_disconnected()
-        if _stop_requested:
+        if _stop_requested or shutdown_requested():
             return 0
         print("Соединение закрыто.")
         return 1
